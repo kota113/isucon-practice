@@ -171,6 +171,110 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
+func getComments(posts []Post, allComments bool) (map[int][]Comment, error) {
+	results := map[int][]Comment{}
+	type CommentInfo struct {
+		Comment
+		User
+	}
+	var postIDs []int
+	for _, p := range posts {
+		postIDs = append(postIDs, p.ID)
+	}
+	var comments []CommentInfo
+	fetchCommentsQuery := `
+SELECT
+	c.*,
+	user.*
+FROM
+    comments c
+JOIN isuconp.users user ON user.id = c.user_id
+WHERE 
+    c.post_id IN (?)
+ORDER BY c.created_at DESC 
+`
+	if !allComments {
+		fetchCommentsQuery += "LIMIT 3"
+	}
+	fetchCommentsQuery, args, err := sqlx.In(fetchCommentsQuery, postIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	fetchCommentsQuery = db.Rebind(fetchCommentsQuery)
+
+	// 取得コメントの数を制限
+	err = db.Select(&comments, fetchCommentsQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range comments {
+		var comment Comment
+		comment = c.Comment
+		comment.User = c.User
+		if _, exists := results[c.Comment.PostID]; !exists {
+			results[c.Comment.PostID] = []Comment{}
+		}
+		results[c.Comment.PostID] = append(results[c.Comment.PostID], comment)
+	}
+	return results, nil
+}
+
+func listPosts(csrfToken string, allComments bool) ([]Post, error) {
+	var results []Post
+	type PostInfo struct {
+		Post
+		User
+		CommentCount int `db:"comment_count"`
+	}
+
+	var posts []PostInfo
+	fetchPostsQuery := `
+SELECT
+        post.*,
+        u.id as "user.id",
+        u.account_name as "user.account_name",
+        u.passhash as "user.passhash",
+        u.authority as "user.authority",
+        u.del_flg as "user.del_flg",
+        u.created_at as "user.created_at",
+        COUNT(c.id) as comment_count
+FROM
+	posts post
+JOIN 
+	isuconp.users u on u.id = post.user_id
+LEFT JOIN 
+	isuconp.comments c on post.id = c.post_id
+GROUP BY post.id, u.id, post.created_at
+ORDER BY
+    post.created_at DESC
+LIMIT ?
+`
+	err := db.Select(&posts, fetchPostsQuery, postsPerPage)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, p := range posts {
+		var post Post
+		post = p.Post
+		post.User = p.User
+		post.CommentCount = p.CommentCount
+		post.CSRFToken = csrfToken
+		results = append(results, post)
+	}
+	// コメントをまとめて取得 (allComments変数があるため分離)
+	comments, err := getComments(results, allComments)
+	if err != nil {
+		log.Printf("コメントの取得に失敗: %v", err)
+	}
+	// todo: 取得ができてないので修正する
+	for i, p := range results {
+		results[i].Comments = comments[p.ID]
+	}
+	return results, nil
+}
+
 func makePosts(results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
@@ -384,15 +488,7 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	results := []Post{}
-
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	posts, err := makePosts(results, getCSRFToken(r), false)
+	posts, err := listPosts(getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
 		return
@@ -438,6 +534,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// todo: listPostsでuser idでの絞り込みに対応
 	posts, err := makePosts(results, getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
@@ -525,7 +622,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		log.Print(err)
 		return
 	}
-
+	// todo: listPostで絞り込みに対応
 	posts, err := makePosts(results, getCSRFToken(r), false)
 	if err != nil {
 		log.Print(err)
@@ -562,6 +659,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// todo: 単一のPostを取得する関数を作成
 	posts, err := makePosts(results, getCSRFToken(r), true)
 	if err != nil {
 		log.Print(err)
@@ -850,5 +948,6 @@ func main() {
 		http.FileServer(http.Dir("../public")).ServeHTTP(w, r)
 	})
 
+	log.Println("Listening on port 8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
